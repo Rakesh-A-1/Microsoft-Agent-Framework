@@ -6,7 +6,13 @@ import streamlit as st
 from agent_framework.openai import OpenAIChatClient
 from agent_framework import ChatMessage, TextContent, Role
 from decouple import config
+from pinecone import Pinecone
+from sentence_transformers import SentenceTransformer
 
+pc = Pinecone(api_key=config("PINECONE_API_KEY"))
+index_name = "ecommerce-products"
+index = pc.Index(index_name)
+model = SentenceTransformer("all-MiniLM-L6-v2")
 OPENAI_API_KEY = config("OPENAI_API_KEY")
 model_id = "gpt-4o-mini"
 
@@ -79,16 +85,56 @@ async def fetch_from_api(user_query: str) -> list:
         return []
 
 async def search_pinecone(user_query: str) -> list:
+    """
+    Real Pinecone semantic search using the PineconeAgent for strict relevance filtering.
+    - Pinecone retrieves top-k matches.
+    - Agent strictly filters only truly relevant products.
+    """
     try:
-        response = requests.get("https://dummyjson.com/products")
-        products = response.json().get("products", [])
+        # 1. Embed the user query
+        query_emb = model.encode(user_query).tolist()
 
-        message = ChatMessage(
-            role=Role.USER,
-            contents=[TextContent(text=f"Query: {user_query}\nProducts: {products}")]
+        # 2. Query Pinecone with top_k only (no filters)
+        response = index.query(
+            vector=query_emb,
+            top_k=50,
+            include_metadata=True
         )
-        result = await pinecone_agent.run(message)
-        return extract_titles_json(result.text)
+
+        # 3. Prepare products for agent relevance filtering
+        products = [
+            {"title": item['metadata']['title'],
+             "category": item['metadata'].get("category", ""),
+             "brand": item['metadata'].get("brand", ""),
+             "price": item['metadata'].get("price", 0),
+             "rating": item['metadata'].get("rating", 0)}
+            for item in response['matches']
+        ]
+
+        # 4. Use pinecone_agent to strictly filter for relevance
+        relevance_message = ChatMessage(
+            role=Role.USER,
+            contents=[TextContent(text=f"""
+            You are a strict product relevance agent.
+            User query: "{user_query}"
+            products: {products}
+
+            Instructions:
+            - Only include products that clearly match the user's query.
+            - Ignore loosely related items (e.g., do not include nail polish when query is lipstick).
+            - Only return the product titles in a JSON list.
+            - Do not add any extra text.
+            """)]
+        )
+
+        relevance_result = await pinecone_agent.run(relevance_message)
+        try:
+            filtered_titles = json.loads(relevance_result.text)
+        except Exception:
+            text = relevance_result.text
+            filtered_titles = re.findall(r'"([^"]+)"', text)
+
+        return filtered_titles
 
     except Exception as e:
         print(f"Pinecone Error: {e}")
