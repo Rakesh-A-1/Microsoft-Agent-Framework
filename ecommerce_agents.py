@@ -9,10 +9,19 @@ from decouple import config
 from pinecone import Pinecone
 from sentence_transformers import SentenceTransformer
 
-pc = Pinecone(api_key=config("PINECONE_API_KEY"))
-index_name = "ecommerce-products"
-index = pc.Index(index_name)
-model = SentenceTransformer("all-MiniLM-L6-v2")
+@st.cache_resource
+def load_pinecone():
+    pc = Pinecone(api_key=config("PINECONE_API_KEY"))
+    return pc.Index("ecommerce-products")
+
+index = load_pinecone()
+@st.cache_resource
+def load_st_model():
+    model = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
+    model.encode(["warmup"])  # Prevent meta tensor issues
+    return model
+
+model = load_st_model()
 OPENAI_API_KEY = config("OPENAI_API_KEY")
 model_id = "gpt-4o-mini"
 
