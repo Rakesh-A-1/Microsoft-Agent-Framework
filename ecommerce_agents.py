@@ -33,7 +33,8 @@ router_agent = OpenAIChatClient(model_id=model_id).create_agent(
     - 'Hybrid' if it requires both filtering and semantic understanding.
     ONLY respond with one of: API, Pinecone, Hybrid. Do not add any extra text.
     """,
-    name="RouterAgent"
+    name="RouterAgent",
+    temperature=0
 )
 
 api_agent = OpenAIChatClient(model_id=model_id).create_agent(
@@ -43,7 +44,8 @@ api_agent = OpenAIChatClient(model_id=model_id).create_agent(
     Return a JSON list of matching product titles only.
     Example: ["Red Lipstick", "Powder Canister"]
     """,
-    name="APIAgent"
+    name="APIAgent",
+    temperature=0
 )
 
 pinecone_agent = OpenAIChatClient(model_id=model_id).create_agent(
@@ -53,7 +55,8 @@ pinecone_agent = OpenAIChatClient(model_id=model_id).create_agent(
     From the given products, return a JSON list of product titles that match semantically.
     Example: ["Red Lipstick", "Powder Canister"]
     """,
-    name="PineconeAgent"
+    name="PineconeAgent",
+    temperature=0
 )
 
 hybrid_agent = OpenAIChatClient(model_id=model_id).create_agent(
@@ -64,7 +67,8 @@ hybrid_agent = OpenAIChatClient(model_id=model_id).create_agent(
     keep the most relevant first, and return a JSON list only.
     Example: ["Red Lipstick", "Powder Canister"]
     """,
-    name="HybridAgent"
+    name="HybridAgent",
+    temperature=0
 )
 
 def extract_titles_json(text: str):
@@ -214,7 +218,9 @@ if st.button("Search"):
                     # Display each matched product
                     for title in final_output:
                         product_data = next((p for p in all_products if p["title"] == title), None)
+
                         if product_data:
+                            # Matching product found — display full details (Crew style)
                             with st.container():
                                 cols = st.columns([1, 3])
                                 with cols[0]:
@@ -223,9 +229,13 @@ if st.button("Search"):
                                     st.subheader(product_data.get("title", "Unnamed Product"))
                                     st.markdown(f"**Brand:** {product_data.get('brand', 'Unknown')}")
                                     st.markdown(f"**Category:** {product_data.get('category', '-')}")
-                                    st.markdown(f"**Price:** ${product_data.get('price', 0):.2f}")
+                                    st.markdown(f"**Price:** ${product_data.get('price', 0)}")
                                     st.markdown(f"⭐ Rating: {product_data.get('rating', 0)} / 5")
-                                st.divider()
+                            st.divider()
+
+                        else:
+                            # Title NOT found in DummyJSON — Crew-style warning
+                            st.warning(f"⚠️ No product details found in DummyJSON for: **{title}**")
                 else:
                     st.warning("No products found.")
             except Exception as e:
