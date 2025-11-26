@@ -207,35 +207,34 @@ if st.button("Search"):
         with st.spinner("🤖 Agents are collaborating..."):
             try:
                 final_output = asyncio.run(route_and_execute(query))
-
-                if isinstance(final_output, list) and len(final_output) > 0:
-                    st.success(f"✅ Found {len(final_output)} products for query: '{query}'")
-                    
-                    # Fetch full product details from DummyJSON for display
+                
+                # Convert product titles to full product objects from DummyJSON
+                if isinstance(final_output, list):
                     response = requests.get("https://dummyjson.com/products")
                     all_products = response.json().get("products", [])
 
-                    # Display each matched product
+                    cleaned = []
                     for title in final_output:
-                        product_data = next((p for p in all_products if p["title"] == title), None)
+                        product = next((p for p in all_products if p["title"].lower() == title.lower()), None)
+                        if product:
+                            cleaned.append(product)
 
-                        if product_data:
-                            # Matching product found — display full details (Crew style)
-                            with st.container():
-                                cols = st.columns([1, 3])
-                                with cols[0]:
-                                    st.image(product_data.get("thumbnail", ""), use_container_width=True)
-                                with cols[1]:
-                                    st.subheader(product_data.get("title", "Unnamed Product"))
-                                    st.markdown(f"**Brand:** {product_data.get('brand', 'Unknown')}")
-                                    st.markdown(f"**Category:** {product_data.get('category', '-')}")
-                                    st.markdown(f"**Price:** ${product_data.get('price', 0)}")
-                                    st.markdown(f"⭐ Rating: {product_data.get('rating', 0)} / 5")
+                    final_output = cleaned
+
+                if isinstance(final_output, list) and len(final_output) > 0:
+                    st.success(f"✅ Found {len(final_output)} products for query: '{query}'")
+                    for p in final_output:
+                        with st.container():
+                            cols = st.columns([1, 3])
+                            with cols[0]:
+                                st.image(p.get("thumbnail", ""), use_container_width=True)
+                            with cols[1]:
+                                st.subheader(p.get("title", "Unnamed Product"))
+                                st.markdown(f"**Brand:** {p.get('brand', 'Unknown')}")
+                                st.markdown(f"**Category:** {p.get('category', '-')}")
+                                st.markdown(f"**Price:** ${p.get('price', 0)}")
+                                st.markdown(f"⭐ Rating: {p.get('rating', 0)} / 5")
                             st.divider()
-
-                        else:
-                            # Title NOT found in DummyJSON — Crew-style warning
-                            st.warning(f"⚠️ No product details found in DummyJSON for: **{title}**")
                 else:
                     st.warning("No products found.")
             except Exception as e:
