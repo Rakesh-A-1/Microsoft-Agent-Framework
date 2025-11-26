@@ -43,6 +43,10 @@ api_agent = OpenAIChatClient(model_id=model_id).create_agent(
     Filter the provided products according to the query.
     Return a JSON list of matching product titles only.
     Example: ["Red Lipstick", "Powder Canister"]
+    Only keep products that EXACTLY match the user's requested product type and filters. 
+    No loose matches, no semantic guessing, no "maybe relevant" items.  
+    If it's not an exact match → delete it.
+    Output only valid JSON.
     """,
     name="APIAgent",
     temperature=0
