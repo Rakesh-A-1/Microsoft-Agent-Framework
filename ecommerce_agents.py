@@ -5,9 +5,21 @@ import re
 import streamlit as st
 from agent_framework.openai import OpenAIChatClient
 from agent_framework import ChatMessage, TextContent, Role
+from agent_framework.observability import setup_observability, get_meter, get_tracer
 from decouple import config
 from pinecone import Pinecone
 from sentence_transformers import SentenceTransformer
+
+setup_observability()
+
+# Custom metrics and spans
+meter = get_meter()
+tracer = get_tracer()
+search_counter = meter.create_counter(
+    name="search_requests_total",
+    description="Total number of product search requests",
+    unit="1"
+)
 
 @st.cache_resource
 def load_pinecone():
@@ -18,27 +30,39 @@ index = load_pinecone()
 @st.cache_resource
 def load_st_model():
     model = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
-    model.encode(["warmup"])  # Prevent meta tensor issues
+    model.encode(["warmup"])
     return model
 
 model = load_st_model()
 OPENAI_API_KEY = config("OPENAI_API_KEY")
 model_id = "gpt-4o-mini"
 
-router_agent = OpenAIChatClient(model_id=model_id).create_agent(
-    instructions="""
+def traced_agent(agent_name, instructions):
+    """Wrap agent.run with a tracer span automatically."""
+    agent = OpenAIChatClient(model_id=model_id).create_agent(
+        instructions=instructions,
+        name=agent_name,
+        temperature=0
+    )
+
+    original_run = agent.run
+
+    async def traced_run(message: ChatMessage):
+        with tracer.start_as_current_span(f"{agent_name}_run"):
+            return await original_run(message)
+
+    agent.run = traced_run
+    return agent
+
+router_agent = traced_agent("RouterAgent", """
     You are a Router Agent. Decide whether a user's query should go to:
     - 'API' if it is a direct request for specific product data.
     - 'Pinecone' if it requires semantic search.
     - 'Hybrid' if it requires both filtering and semantic understanding.
     ONLY respond with one of: API, Pinecone, Hybrid. Do not add any extra text.
-    """,
-    name="RouterAgent",
-    temperature=0
-)
+""")
 
-api_agent = OpenAIChatClient(model_id=model_id).create_agent(
-    instructions="""
+api_agent = traced_agent("APIAgent", """
     You are an API Agent. User query is provided.
     Filter the provided products according to the query.
     Return a JSON list of matching product titles only.
@@ -47,33 +71,22 @@ api_agent = OpenAIChatClient(model_id=model_id).create_agent(
     No loose matches, no semantic guessing, no "maybe relevant" items.  
     If it's not an exact match → delete it.
     Output only valid JSON.
-    """,
-    name="APIAgent",
-    temperature=0
-)
+""")
 
-pinecone_agent = OpenAIChatClient(model_id=model_id).create_agent(
-    instructions="""
+pinecone_agent = traced_agent("PineconeAgent", """
     You are a semantic product search agent.
     User query is provided.
     From the given products, return a JSON list of product titles that match semantically.
     Example: ["Red Lipstick", "Powder Canister"]
-    """,
-    name="PineconeAgent",
-    temperature=0
-)
+""")
 
-hybrid_agent = OpenAIChatClient(model_id=model_id).create_agent(
-    instructions="""
+hybrid_agent = traced_agent("HybridAgent", """
     You are a product merging agent.
     User query is provided along with API and Pinecone results.
     Combine these lists into a single list of product titles, remove duplicates,
     keep the most relevant first, and return a JSON list only.
     Example: ["Red Lipstick", "Powder Canister"]
-    """,
-    name="HybridAgent",
-    temperature=0
-)
+""")
 
 def extract_titles_json(text: str):
     try:
@@ -96,7 +109,6 @@ async def fetch_from_api(user_query: str) -> list:
         )
         result = await api_agent.run(message)
         return extract_titles_json(result.text)
-
     except Exception as e:
         print(f"API Error: {e}")
         return []
@@ -135,7 +147,6 @@ async def search_pinecone(user_query: str) -> list:
             You are a strict product relevance agent.
             User query: "{user_query}"
             products: {products}
-
             Instructions:
             - Only include products that clearly match the user's query.
             - Ignore loosely related items (e.g., do not include nail polish when query is lipstick).
@@ -148,11 +159,9 @@ async def search_pinecone(user_query: str) -> list:
         try:
             filtered_titles = json.loads(relevance_result.text)
         except Exception:
-            text = relevance_result.text
-            filtered_titles = re.findall(r'"([^"]+)"', text)
+            filtered_titles = re.findall(r'"([^"]+)"', relevance_result.text)
 
         return filtered_titles
-
     except Exception as e:
         print(f"Pinecone Error: {e}")
         return []
@@ -170,35 +179,36 @@ async def hybrid_search(user_query: str) -> list:
         )
         result = await hybrid_agent.run(message)
         return extract_titles_json(result.text)
-
     except Exception as e:
         print(f"Hybrid Error: {e}")
         return []
 
 async def route_and_execute(user_query: str) -> list:
-    message = ChatMessage(
-        role=Role.USER,
-        contents=[TextContent(text=user_query)]
-    )
+    search_counter.add(1, {"query": user_query})  # Increment custom metric
+    with tracer.start_as_current_span("route_and_execute"):
+        message = ChatMessage(
+            role=Role.USER,
+            contents=[TextContent(text=user_query)]
+        )
+        result = await router_agent.run(message)
+        route = result.text.strip()
 
-    result = await router_agent.run(message)
-    route = result.text.strip()
-    print(f"\nUser Query: {user_query}")
-    print(f"Router Decision: {route}")
+        print(f"\nUser Query: {user_query}")
+        print(f"Router Decision: {route}")
 
-    if route == "API":
-        return await fetch_from_api(user_query)
-    elif route == "Pinecone":
-        return await search_pinecone(user_query)
-    elif route == "Hybrid":
-        return await hybrid_search(user_query)
-    else:
-        return []
+        if route == "API":
+            return await fetch_from_api(user_query)
+        elif route == "Pinecone":
+            return await search_pinecone(user_query)
+        elif route == "Hybrid":
+            return await hybrid_search(user_query)
+        else:
+            return []
 
 st.set_page_config(page_title="Microsoft E-Commerce Search", layout="wide")
 st.title("🛍️ Microsoft E-Commerce Search Assistant")
 st.markdown(
-    "Enter a product query — the agents will decide whether to use the API or Pinecone or Hybrid, "
+    "Enter a product query — the agents will decide whether to use the API, Pinecone, or Hybrid, "
     "retrieve results, verify them, and display the best-matched items."
 )
 
@@ -211,7 +221,7 @@ if st.button("Search"):
         with st.spinner("🤖 Agents are collaborating..."):
             try:
                 final_output = asyncio.run(route_and_execute(query))
-                
+
                 # Convert product titles to full product objects from DummyJSON
                 if isinstance(final_output, list):
                     response = requests.get("https://dummyjson.com/products")
@@ -222,7 +232,6 @@ if st.button("Search"):
                         product = next((p for p in all_products if p["title"].lower() == title.lower()), None)
                         if product:
                             cleaned.append(product)
-
                     final_output = cleaned
 
                 if isinstance(final_output, list) and len(final_output) > 0:
@@ -231,7 +240,7 @@ if st.button("Search"):
                         with st.container():
                             cols = st.columns([1, 3])
                             with cols[0]:
-                                st.image(p.get("thumbnail", ""), use_container_width=True)
+                                st.image(p.get("thumbnail", ""), width='stretch')
                             with cols[1]:
                                 st.subheader(p.get("title", "Unnamed Product"))
                                 st.markdown(f"**Brand:** {p.get('brand', 'Unknown')}")
