@@ -9,6 +9,7 @@ from agent_framework.observability import setup_observability, get_meter, get_tr
 from decouple import config
 from pinecone import Pinecone
 from sentence_transformers import SentenceTransformer
+from conversation_storage import save_thread, restore_last_thread
 
 setup_observability()
 
@@ -48,8 +49,10 @@ def traced_agent(agent_name, instructions):
 
     original_run = agent.run
 
-    async def traced_run(message: ChatMessage):
+    async def traced_run(message: ChatMessage, thread=None):
         with tracer.start_as_current_span(f"{agent_name}_run"):
+            if thread is not None:
+                return await original_run(message, thread=thread)
             return await original_run(message)
 
     agent.run = traced_run
@@ -122,7 +125,7 @@ def extract_titles_json(text: str):
         titles += re.findall(r"\d+\.\s*([^\n]+)", text)
         return [t.strip() for t in titles if t.strip()]
 
-async def fetch_from_api(user_query: str) -> list:
+async def fetch_from_api(user_query: str, thread) -> list:
     try:
         # Fetch all products
         response = requests.get("https://dummyjson.com/products")
@@ -132,13 +135,13 @@ async def fetch_from_api(user_query: str) -> list:
             role=Role.USER,
             contents=[TextContent(text=f"Query: {user_query}\nProducts: {products}")]
         )
-        result = await api_agent.run(message)
+        result = await api_agent.run(message, thread)
         return json.loads(result.text)
     except Exception as e:
         print(f"API Error: {e}")
         return []
 
-async def search_pinecone(user_query: str) -> list:
+async def search_pinecone(user_query: str, thread) -> list:
     """
     Real Pinecone semantic search using the PineconeAgent for strict relevance filtering.
     - Pinecone retrieves top-k matches.
@@ -182,7 +185,7 @@ async def search_pinecone(user_query: str) -> list:
             """)]
         )
 
-        relevance_result = await pinecone_agent.run(relevance_message)
+        relevance_result = await pinecone_agent.run(relevance_message, thread)
         # Safely parse JSON
         try:
             return json.loads(relevance_result.text)
@@ -195,7 +198,7 @@ async def search_pinecone(user_query: str) -> list:
         print(f"Pinecone Error: {e}")
         return []
 
-async def hybrid_search(user_query: str) -> list:
+async def hybrid_search(user_query: str, thread) -> list:
     try:
         api_results = await fetch_from_api(user_query)
         pinecone_results = await search_pinecone(user_query)
@@ -206,23 +209,27 @@ async def hybrid_search(user_query: str) -> list:
                 text=f"Query: {user_query}\nAPI Results: {api_results}\nPinecone Results: {pinecone_results}"
             )]
         )
-        result = await hybrid_agent.run(message)
+        result = await hybrid_agent.run(message, thread)
         return extract_titles_json(result.text)
     except Exception as e:
         print(f"Hybrid Error: {e}")
         return []
 
-async def route_and_execute(user_query: str) -> list:
-    search_counter.add(1, {"query": user_query})  # Increment custom metric
+async def route_and_execute(user_query: str, thread):
+    search_counter.add(1, {"query": user_query})
+
     with tracer.start_as_current_span("route_and_execute"):
         message = ChatMessage(
             role=Role.USER,
             contents=[TextContent(text=user_query)]
         )
-        result = await router_agent.run(message)
+
+        # Pass the thread here — this ensures persistence
+        result = await router_agent.run(message, thread=thread)
+
         try:
             route_json = json.loads(result.text.strip())
-            route = route_json.get("source","")
+            route = route_json.get("source", "")
         except:
             route = result.text.strip()
 
@@ -230,13 +237,15 @@ async def route_and_execute(user_query: str) -> list:
         print(f"Router Decision: {route}")
 
         if route == "API":
-            return await fetch_from_api(user_query)
+            search_results = await fetch_from_api(user_query, thread)
         elif route == "Pinecone":
-            return await search_pinecone(user_query)
+            search_results = await search_pinecone(user_query, thread)
         elif route == "Hybrid":
-            return await hybrid_search(user_query)
+            search_results = await hybrid_search(user_query, thread)
         else:
-            return []
+            search_results = []
+
+        return search_results
 
 st.set_page_config(page_title="Microsoft E-Commerce Search", layout="wide")
 st.title("🛍️ Microsoft E-Commerce Search Assistant")
@@ -246,15 +255,24 @@ st.markdown(
 )
 
 query = st.text_input("🔍 What are you looking for?", placeholder="e.g., iPhone, laptops, similar to Samsung, all products")
+async def run_search(query):
+    # Restore or create a new thread
+    thread = await restore_last_thread(router_agent)
 
+    # Run agent pipeline
+    final_output = await route_and_execute(query, thread)
+
+    # Save updated conversation state
+    await save_thread(thread)
+
+    return final_output
 if st.button("Search"):
     if not query.strip():
         st.warning("Please enter a query before searching.")
     else:
         with st.spinner("🤖 Agents are collaborating..."):
             try:
-                final_output = asyncio.run(route_and_execute(query))
-
+                final_output = asyncio.run(run_search(query))
                 if isinstance(final_output, list) and len(final_output) > 0:
                     st.success(f"✅ Found {len(final_output)} products for query: '{query}'")
                     for p in final_output:
