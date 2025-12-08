@@ -42,7 +42,8 @@ def traced_agent(agent_name, instructions):
     agent = OpenAIChatClient(model_id=model_id).create_agent(
         instructions=instructions,
         name=agent_name,
-        temperature=0
+        temperature=0,
+        seed=42
     )
 
     original_run = agent.run
@@ -55,37 +56,61 @@ def traced_agent(agent_name, instructions):
     return agent
 
 router_agent = traced_agent("RouterAgent", """
-    You are a Router Agent. Decide whether a user's query should go to:
-    - 'API' if it is a direct request for specific product data.
-    - 'Pinecone' if it requires semantic search.
-    - 'Hybrid' if it requires both filtering and semantic understanding.
-    ONLY respond with one of: API, Pinecone, Hybrid. Do not add any extra text.
+    Respond with: {"source": "API" | "Pinecone" | "Hybrid", "reason": "brief explanation"}
+    Rules:
+    - Use API when:
+    - Query is generic full list.
+    - Exact match for product, brand, or known category (e.g., beauty, electronics).
+    - Contains numeric/logical filters (price, rating, stock).
+    - Pinecone for semantic meaning queries only (e.g., "luxury skincare", "long lasting phones").
+    - Hybrid only when BOTH semantic meaning AND numeric/logical filters exist.
+    Output ONLY the JSON.
 """)
 
 api_agent = traced_agent("APIAgent", """
     You are an API Agent. User query is provided.
     Filter the provided products according to the query.
-    Return a JSON list of matching product titles only.
-    Example: ["Red Lipstick", "Powder Canister"]
     Only keep products that EXACTLY match the user's requested product type and filters. 
     No loose matches, no semantic guessing, no "maybe relevant" items.  
     If it's not an exact match → delete it.
-    Output only valid JSON.
+    Output must be ONLY valid JSON (a list of product objects).
+    Do not return titles only. Do not return text or explanations.
+    Each returned product must include all original fields, including thumbnail, brand, category, rating, price.
+    Only include products that clearly match the user's query; remove anything that does not directly match.
+    Example output:
+    [
+      {"title": "iPhone 9", "brand": "Apple", "price": 549},
+      {"title": "iPhone X", "brand": "Apple", "price": 899}
+    ]
 """)
 
 pinecone_agent = traced_agent("PineconeAgent", """
     You are a semantic product search agent.
     User query is provided.
-    From the given products, return a JSON list of product titles that match semantically.
-    Example: ["Red Lipstick", "Powder Canister"]
+    From the given products, return a JSON list of product that match semantically.
+    Do not return titles only. Do not return text or explanations.
+    Each returned product must include all original fields, including thumbnail, brand, category, rating, price.
+    Only include products that clearly match the user's query; remove anything that does not directly match.
+    Example output:
+    [
+      {"title": "iPhone 9", "brand": "Apple", "price": 549},
+      {"title": "iPhone X", "brand": "Apple", "price": 899}
+    ]
 """)
 
 hybrid_agent = traced_agent("HybridAgent", """
     You are a product merging agent.
     User query is provided along with API and Pinecone results.
-    Combine these lists into a single list of product titles, remove duplicates,
+    Combine these lists into a single list of product, remove duplicates,
     keep the most relevant first, and return a JSON list only.
-    Example: ["Red Lipstick", "Powder Canister"]
+    Do not return titles only. Do not return text or explanations.
+    Each returned product must include all original fields, including thumbnail, brand, category, rating, price.
+    Only include products that clearly match the user's query; remove anything that does not directly match.
+    Example output:
+    [
+      {"title": "iPhone 9", "brand": "Apple", "price": 549},
+      {"title": "iPhone X", "brand": "Apple", "price": 899}
+    ]
 """)
 
 def extract_titles_json(text: str):
@@ -108,7 +133,7 @@ async def fetch_from_api(user_query: str) -> list:
             contents=[TextContent(text=f"Query: {user_query}\nProducts: {products}")]
         )
         result = await api_agent.run(message)
-        return extract_titles_json(result.text)
+        return json.loads(result.text)
     except Exception as e:
         print(f"API Error: {e}")
         return []
@@ -118,6 +143,7 @@ async def search_pinecone(user_query: str) -> list:
     Real Pinecone semantic search using the PineconeAgent for strict relevance filtering.
     - Pinecone retrieves top-k matches.
     - Agent strictly filters only truly relevant products.
+    - Returns full product objects.
     """
     try:
         # 1. Embed the user query
@@ -136,7 +162,8 @@ async def search_pinecone(user_query: str) -> list:
              "category": item['metadata'].get("category", ""),
              "brand": item['metadata'].get("brand", ""),
              "price": item['metadata'].get("price", 0),
-             "rating": item['metadata'].get("rating", 0)}
+             "rating": item['metadata'].get("rating", 0),
+             "thumbnail": item['metadata'].get("thumbnail", "")}
             for item in response['matches']
         ]
 
@@ -150,18 +177,20 @@ async def search_pinecone(user_query: str) -> list:
             Instructions:
             - Only include products that clearly match the user's query.
             - Ignore loosely related items (e.g., do not include nail polish when query is lipstick).
-            - Only return the product titles in a JSON list.
-            - Do not add any extra text.
+            - Return FULL product objects in a JSON list.
+            - Do not return titles only or any extra text.
             """)]
         )
 
         relevance_result = await pinecone_agent.run(relevance_message)
+        # Safely parse JSON
         try:
-            filtered_titles = json.loads(relevance_result.text)
+            return json.loads(relevance_result.text)
         except Exception:
-            filtered_titles = re.findall(r'"([^"]+)"', relevance_result.text)
+            # fallback: wrap titles as objects
+            titles = re.findall(r'"([^"]+)"', relevance_result.text)
+            return [{"title": t} for t in titles]
 
-        return filtered_titles
     except Exception as e:
         print(f"Pinecone Error: {e}")
         return []
@@ -191,7 +220,11 @@ async def route_and_execute(user_query: str) -> list:
             contents=[TextContent(text=user_query)]
         )
         result = await router_agent.run(message)
-        route = result.text.strip()
+        try:
+            route_json = json.loads(result.text.strip())
+            route = route_json.get("source","")
+        except:
+            route = result.text.strip()
 
         print(f"\nUser Query: {user_query}")
         print(f"Router Decision: {route}")
@@ -221,18 +254,6 @@ if st.button("Search"):
         with st.spinner("🤖 Agents are collaborating..."):
             try:
                 final_output = asyncio.run(route_and_execute(query))
-
-                # Convert product titles to full product objects from DummyJSON
-                if isinstance(final_output, list):
-                    response = requests.get("https://dummyjson.com/products")
-                    all_products = response.json().get("products", [])
-
-                    cleaned = []
-                    for title in final_output:
-                        product = next((p for p in all_products if p["title"].lower() == title.lower()), None)
-                        if product:
-                            cleaned.append(product)
-                    final_output = cleaned
 
                 if isinstance(final_output, list) and len(final_output) > 0:
                     st.success(f"✅ Found {len(final_output)} products for query: '{query}'")
