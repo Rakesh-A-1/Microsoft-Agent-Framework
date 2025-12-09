@@ -200,8 +200,8 @@ async def search_pinecone(user_query: str, thread) -> list:
 
 async def hybrid_search(user_query: str, thread) -> list:
     try:
-        api_results = await fetch_from_api(user_query)
-        pinecone_results = await search_pinecone(user_query)
+        api_results = await fetch_from_api(user_query, thread)
+        pinecone_results = await search_pinecone(user_query, thread)
 
         message = ChatMessage(
             role=Role.USER,
