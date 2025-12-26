@@ -116,6 +116,26 @@ hybrid_agent = traced_agent("HybridAgent", """
     ]
 """)
 
+response_agent = traced_agent("ResponseAgent", """
+You are a Response Composer Agent.
+
+Input:
+- User query
+- A verified list of products (JSON)
+
+Your job:
+- Write a natural, friendly response like ChatGPT
+- Briefly introduce the result
+- DO NOT modify product data
+- DO NOT add or remove products
+- DO NOT mention internal agents or logic
+- End with a polite, non-repetitive follow-up question
+
+Output rules:
+- Plain text only
+- No JSON
+""")
+
 def extract_titles_json(text: str):
     try:
         return json.loads(text)
@@ -247,50 +267,101 @@ async def route_and_execute(user_query: str, thread):
 
         return search_results
 
-st.set_page_config(page_title="Microsoft E-Commerce Search", layout="wide")
-st.title("🛍️ Microsoft E-Commerce Search Assistant")
-st.markdown(
-    "Enter a product query — the agents will decide whether to use the API, Pinecone, or Hybrid, "
-    "retrieve results, verify them, and display the best-matched items."
+st.set_page_config(
+    page_title="E-commerce AI Agent",
+    page_icon="🛍️",
+    layout="wide"
 )
 
-query = st.text_input("🔍 What are you looking for?", placeholder="e.g., iPhone, laptops, similar to Samsung, all products")
-async def run_search(query):
-    # Restore or create a new thread
-    thread = await restore_last_thread(router_agent)
+if "thread" not in st.session_state:
+    st.session_state.thread = None
 
-    # Run agent pipeline
-    final_output = await route_and_execute(query, thread)
+st.title("🛍️ E-commerce AI Agent")
+st.markdown("""
+This agent can help you find products using:
+- **Structured Data** (DummyJSON API)
+- **Semantic Search** (Pinecone)
+- **Hybrid Search**
+""")
 
-    # Save updated conversation state
-    await save_thread(thread)
+# Sidebar
+with st.sidebar:
+    st.header("Configuration")
+    st.info("Ensure your `.env` file is set up correctly.")
+    if st.button("Reload Agent"):
+        st.cache_resource.clear()
+        st.success("Agent reloaded!")
 
-    return final_output
-if st.button("Search"):
-    if not query.strip():
-        st.warning("Please enter a query before searching.")
-    else:
-        with st.spinner("🤖 Agents are collaborating..."):
+# Chat history
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+# Render history (DO NOT ERASE)
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+
+# User input
+prompt = st.chat_input("Ask about a product...")
+
+if prompt:
+    # Store user message
+    st.session_state.messages.append({
+        "role": "user",
+        "content": prompt
+    })
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    # Assistant response
+    with st.chat_message("assistant"):
+        with st.spinner("Thinking..."):
             try:
-                final_output = asyncio.run(run_search(query))
-                if isinstance(final_output, list) and len(final_output) > 0:
-                    st.success(f"✅ Found {len(final_output)} products for query: '{query}'")
-                    for p in final_output:
-                        with st.container():
-                            cols = st.columns([1, 3])
-                            with cols[0]:
-                                st.image(p.get("thumbnail", ""), width='stretch')
-                            with cols[1]:
-                                st.subheader(p.get("title", "Unnamed Product"))
-                                st.markdown(f"**Brand:** {p.get('brand', 'Unknown')}")
-                                st.markdown(f"**Category:** {p.get('category', '-')}")
-                                st.markdown(f"**Price:** ${p.get('price', 0)}")
-                                st.markdown(f"⭐ Rating: {p.get('rating', 0)} / 5")
-                            st.divider()
-                else:
-                    st.warning("No products found.")
-            except Exception as e:
-                st.error(f"⚠️ Error during search: {e}")
+                results = asyncio.run(
+                    route_and_execute(prompt, st.session_state.thread)
+                )
 
-st.markdown("---")
-st.caption("Powered by Microsoft Agent Framework + Pinecone + DummyJSON API")
+                if results:
+                    convo_message = ChatMessage(
+                        role=Role.USER,
+                        contents=[TextContent(text=f"""
+    User query: {prompt}
+
+    Products (use each product ONCE, no repetition):
+    {json.dumps(results, indent=2)}
+
+    Rules:
+    - Mention each product only once
+    - Include title, brand, category, price, rating
+    - Do NOT repeat product names
+    - Do NOT say "Found X products"
+    - End with a friendly follow-up
+    """)]
+                    )
+
+                    convo_result = asyncio.run(
+                        response_agent.run(convo_message, st.session_state.thread)
+                    )
+
+                    # Show ONLY conversational response
+                    st.markdown(convo_result.text)
+
+                    # Save EXACT same text to history
+                    st.session_state.messages.append({
+                        "role": "assistant",
+                        "content": convo_result.text
+                    })
+
+                else:
+                    st.markdown("No products found.")
+                    st.session_state.messages.append({
+                        "role": "assistant",
+                        "content": "No products found."
+                    })
+
+            except Exception as e:
+                st.error(str(e))
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "content": f"Error: {e}"
+                })
