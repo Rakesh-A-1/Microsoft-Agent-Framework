@@ -58,6 +58,20 @@ def traced_agent(agent_name, instructions):
     agent.run = traced_run
     return agent
 
+reformulator_agent = traced_agent("ReformulatorAgent", """
+    You are a Search Query Refiner.
+    Your goal is to rewrite the latest user input into a STANDALONE search query.
+    
+    Input:
+    - Conversation History
+    - Latest User Query
+    
+    Rules:
+    1. Resolve references (e.g., "Cheaper ones" -> "Cheaper iPhones").
+    2. If the user changes topic, output the new topic only.
+    3. Output ONLY the raw query string. No JSON.
+""")
+
 router_agent = traced_agent("RouterAgent", """
     Respond with: {"source": "API" | "Pinecone" | "Hybrid", "reason": "brief explanation"}
     Rules:
@@ -236,15 +250,35 @@ async def hybrid_search(user_query: str, thread) -> list:
         return []
 
 async def route_and_execute(user_query: str, thread):
-    search_counter.add(1, {"query": user_query})
+    history_entries = st.session_state.messages[-5:] 
+    history_text = "\n".join([f"{msg['role']}: {msg['content']}" for msg in history_entries])
+
+    with tracer.start_as_current_span("query_reformulation"):
+        reform_message = ChatMessage(
+            role=Role.USER, 
+            contents=[TextContent(text=f"""
+                Conversation History:
+                {history_text}
+                
+                Latest User Query: "{user_query}"
+                
+                Output the standalone search query:
+            """)]
+        )
+        
+        reform_result = await reformulator_agent.run(reform_message)
+        refined_query = reform_result.text.strip()
+        
+        print(f"Original: {user_query} - Refined: {refined_query}")
+
+    search_counter.add(1, {"query": refined_query})
 
     with tracer.start_as_current_span("route_and_execute"):
         message = ChatMessage(
             role=Role.USER,
-            contents=[TextContent(text=user_query)]
+            contents=[TextContent(text=refined_query)]
         )
 
-        # Pass the thread here — this ensures persistence
         result = await router_agent.run(message, thread=thread)
 
         try:
@@ -253,15 +287,14 @@ async def route_and_execute(user_query: str, thread):
         except:
             route = result.text.strip()
 
-        print(f"\nUser Query: {user_query}")
         print(f"Router Decision: {route}")
 
         if route == "API":
-            search_results = await fetch_from_api(user_query, thread)
+            search_results = await fetch_from_api(refined_query, thread)
         elif route == "Pinecone":
-            search_results = await search_pinecone(user_query, thread)
+            search_results = await search_pinecone(refined_query, thread)
         elif route == "Hybrid":
-            search_results = await hybrid_search(user_query, thread)
+            search_results = await hybrid_search(refined_query, thread)
         else:
             search_results = []
 
