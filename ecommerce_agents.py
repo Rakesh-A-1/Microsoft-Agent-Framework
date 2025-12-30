@@ -159,7 +159,7 @@ def extract_titles_json(text: str):
         titles += re.findall(r"\d+\.\s*([^\n]+)", text)
         return [t.strip() for t in titles if t.strip()]
 
-async def fetch_from_api(user_query: str, thread) -> list:
+async def fetch_from_api(user_query: str) -> list:
     try:
         # Fetch all products
         response = requests.get("https://dummyjson.com/products")
@@ -169,13 +169,13 @@ async def fetch_from_api(user_query: str, thread) -> list:
             role=Role.USER,
             contents=[TextContent(text=f"Query: {user_query}\nProducts: {products}")]
         )
-        result = await api_agent.run(message, thread)
+        result = await api_agent.run(message)
         return json.loads(result.text)
     except Exception as e:
         print(f"API Error: {e}")
         return []
 
-async def search_pinecone(user_query: str, thread) -> list:
+async def search_pinecone(user_query: str) -> list:
     """
     Real Pinecone semantic search using the PineconeAgent for strict relevance filtering.
     - Pinecone retrieves top-k matches.
@@ -219,8 +219,7 @@ async def search_pinecone(user_query: str, thread) -> list:
             """)]
         )
 
-        relevance_result = await pinecone_agent.run(relevance_message, thread)
-        # Safely parse JSON
+        relevance_result = await pinecone_agent.run(relevance_message)
         try:
             return json.loads(relevance_result.text)
         except Exception:
@@ -232,10 +231,10 @@ async def search_pinecone(user_query: str, thread) -> list:
         print(f"Pinecone Error: {e}")
         return []
 
-async def hybrid_search(user_query: str, thread) -> list:
+async def hybrid_search(user_query: str) -> list:
     try:
-        api_results = await fetch_from_api(user_query, thread)
-        pinecone_results = await search_pinecone(user_query, thread)
+        api_results = await fetch_from_api(user_query)
+        pinecone_results = await search_pinecone(user_query)
 
         message = ChatMessage(
             role=Role.USER,
@@ -243,14 +242,14 @@ async def hybrid_search(user_query: str, thread) -> list:
                 text=f"Query: {user_query}\nAPI Results: {api_results}\nPinecone Results: {pinecone_results}"
             )]
         )
-        result = await hybrid_agent.run(message, thread)
+        result = await hybrid_agent.run(message)
         return extract_titles_json(result.text)
     except Exception as e:
         print(f"Hybrid Error: {e}")
         return []
 
-async def route_and_execute(user_query: str, thread):
-    history_entries = st.session_state.messages[-5:] 
+async def route_and_execute(user_query: str, thread, history_list):
+    history_entries = history_list[-5:]
     history_text = "\n".join([f"{msg['role']}: {msg['content']}" for msg in history_entries])
 
     with tracer.start_as_current_span("query_reformulation"):
@@ -290,11 +289,11 @@ async def route_and_execute(user_query: str, thread):
         print(f"Router Decision: {route}")
 
         if route == "API":
-            search_results = await fetch_from_api(refined_query, thread)
+            search_results = await fetch_from_api(refined_query)
         elif route == "Pinecone":
-            search_results = await search_pinecone(refined_query, thread)
+            search_results = await search_pinecone(refined_query)
         elif route == "Hybrid":
-            search_results = await hybrid_search(refined_query, thread)
+            search_results = await hybrid_search(refined_query)
         else:
             search_results = []
 
@@ -306,10 +305,11 @@ st.set_page_config(
     layout="wide"
 )
 
-if "thread" not in st.session_state:
-    st.session_state.thread = None
+if "initialized" not in st.session_state:
+    st.session_state.thread, st.session_state.messages = asyncio.run(restore_last_thread(router_agent))
+    st.session_state.initialized = True
 
-st.title("🛍️ E-commerce AI Agent")
+st.title("🛍️ Microsoft E-commerce AI Agent")
 st.markdown("""
 This agent can help you find products using:
 - **Structured Data** (DummyJSON API)
@@ -317,13 +317,13 @@ This agent can help you find products using:
 - **Hybrid Search**
 """)
 
-# Sidebar
+# sidebar
 with st.sidebar:
-    st.header("Configuration")
-    st.info("Ensure your `.env` file is set up correctly.")
-    if st.button("Reload Agent"):
-        st.cache_resource.clear()
-        st.success("Agent reloaded!")
+    st.header("Configuration") 
+    st.info("Ensure your .env file contains required API keys.") 
+    if st.button("Clear Chat"): 
+        st.session_state.messages = [] 
+        st.success("Chat cleared")
 
 # Chat history
 if "messages" not in st.session_state:
@@ -351,7 +351,7 @@ if prompt:
         with st.spinner("Thinking..."):
             try:
                 results = asyncio.run(
-                    route_and_execute(prompt, st.session_state.thread)
+                    route_and_execute(prompt, st.session_state.thread, st.session_state.messages)
                 )
 
                 if results:
@@ -391,6 +391,10 @@ if prompt:
                         "role": "assistant",
                         "content": "No products found."
                     })
+                
+                asyncio.run(
+                    save_thread(st.session_state.thread, st.session_state.messages)
+                )
 
             except Exception as e:
                 st.error(str(e))
